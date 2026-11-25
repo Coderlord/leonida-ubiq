@@ -40,7 +40,7 @@ Only when your shell has not set them already (`-DryRun` prints the final list):
 | `LEONIDA_PIPELINE_CACHE_DIR` | `<out>\pipeline-cache` | one warmed cache shared by every build you boot |
 | `LEONIDA_PEEK` / `_SECONDS` | the game-state and session-state RVAs from `LEONIDA_GAME_STATE_RVA` and `LEONIDA_SESSION_STATE_RVA` (measured locally, not kept here; unset: no peek) / `5` | game state and session state (low dword), the two numbers every RESULT reports |
 | `LEONIDA_DEVICE_FAULT` | `1` | on device loss: `VK_EXT_device_fault` info, checkpoints, last replay steps |
-| `LEONIDA_KEYBOARD_PAD` | `always` (with an input script) | keyboard as a pad even unfocused, so the script's presses arrive |
+| `LEONIDA_KEYBOARD_PAD` | `1` (with an input script) | the keyboard pad: the script's presses arrive unfocused, the machine's own keyboard and mouse only through the focused game window |
 | `LEONIDA_CAPTURE_EVERY` / `_LIMIT` | `60` / `40` | a swapchain read-back every 60 presents, at most 40 |
 | `DISABLE_RTSS_LAYER`, `DISABLE_VULKAN_OBS_CAPTURE` | `1` | keep third-party Vulkan overlay layers out of the process |
 
