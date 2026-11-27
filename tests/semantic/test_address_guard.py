@@ -97,6 +97,28 @@ class GuardedFixture(unittest.TestCase):
         self.assertTrue(set(others) <= calls, set(others) - calls)
 
 
+class RefusalCountsOnlyAccesses(unittest.TestCase):
+    """buffer_load_dword computes the guarded address for every lane, before its bounds checks. A lane whose load
+    never runs (out of the V#'s range, or inactive) gets the sink but is not counted, so the header's count and last
+    offset describe accesses that happened. The out-of-range load still reads 0, as on hardware."""
+
+    @staticmethod
+    def program(offset):
+        # One raw buffer load through a V# at 0xa0000 (unbacked in gpu.heap; 0x100 bytes of records), stored to out[0].
+        return ["s_mov_b32 s4, 0xa0000", "s_mov_b32 s5, 0", "s_mov_b32 s6, 0x100", "s_mov_b32 s7, 0x31016fac",
+                f"v_mov_b32_e32 v8, {offset:#x}", "buffer_load_dword v8, v8, s[4:7], 0 offen", "s_waitcnt vmcnt(0)",
+                "v_mov_b32_e32 v9, 0", "buffer_store_dword v8, v9, s[0:3], 0 offen", "s_endpgm"]
+
+    def run_one(self, offset):
+        mem = run(translate("cs_guard_count", lines=self.program(offset)), gpu.heap(True))
+        return mem.get(0, 0), mem.get(ag.HEADER + 24, 0)
+
+    def test_in_range_refusal_counts(self):
+        self.assertEqual(self.run_one(0), (0, 1))       # refused: reads the zero area, counted
+
+    def test_out_of_range_lane_is_not_counted(self):
+        self.assertEqual(self.run_one(0x200), (0, 0))   # past num_records: 0 without a load, nothing counted
+
 class GuardForms(unittest.TestCase):
     """The kind and span each instruction family passes, read off the %guard_fn calls (sink, last-byte delta)."""
 

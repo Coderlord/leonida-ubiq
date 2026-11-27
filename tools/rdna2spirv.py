@@ -184,13 +184,15 @@ def guard_function(cl, cu):
     heap_base + offset after one compare. Otherwise the page table at heap_base + table decides, per 4 KiB page of the
     first and the last byte: level 1 is GUARD_L1 words indexed by offset bits 47..32 (the level-2 block of that 4 GiB
     chunk: 0 none backed, 1 all), level 2 is one bit per page (bits 31..12), GUARD_BLOCK_WORDS words a block, after
-    level 1. A refused access counts itself in the header and goes to heap_base + sink + (offset & 0xFFF)."""
+    level 1. A refused access goes to heap_base + sink + (offset & 0xFFF), and counts itself in the header when `count`
+    holds: whether the access happens (a buffer load computes its address for every lane before its bounds checks,
+    and a lane that is inactive or out of range never loads)."""
     ul = "%ulong"
     L = ["%guard_fn = OpFunction %ulong None %fn_guard",
          "%ga_hb = OpFunctionParameter %ulong", "%ga_on = OpFunctionParameter %bool",
          "%ga_lim = OpFunctionParameter %ulong", "%ga_tab = OpFunctionParameter %ulong",
          "%ga_off = OpFunctionParameter %ulong", "%ga_delta = OpFunctionParameter %ulong",
-         "%ga_sink = OpFunctionParameter %ulong",
+         "%ga_sink = OpFunctionParameter %ulong", "%ga_count = OpFunctionParameter %bool",
          "%ga_entry = OpLabel",
          f"%ga_end = OpIAdd {ul} %ga_off %ga_delta",
          f"%ga_a = OpULessThan %bool %ga_off %ga_lim",
@@ -233,6 +235,9 @@ def guard_function(cl, cu):
           "OpSelectionMerge %ga_rm None",
           "OpBranchConditional %ga_ok %ga_rm %ga_ref",
           "%ga_ref = OpLabel",
+          "OpSelectionMerge %ga_rc None",
+          "OpBranchConditional %ga_count %ga_rec %ga_rc",
+          "%ga_rec = OpLabel",
           # The refusal count (header +24) and the last refused offset (+32, low dword first): what the runtime logs.
           f"%ga_h = OpIAdd {ul} %ga_hb {hdr}",
           "%ga_hp = OpConvertUToPtr %_ptr_PSB_arr %ga_h",
@@ -248,6 +253,8 @@ def guard_function(cl, cu):
           # The refusing module's id (+28, diagnostics): GUARD_MODULE_ID, FNV-1a of the translated file's stem.
           f"%ga_ip = OpAccessChain %_ptr_PSB_uint %ga_hp {cu(7)}",
           f"OpStore %ga_ip {cu(GUARD_MODULE_ID)} Aligned 4",
+          "OpBranch %ga_rc",
+          "%ga_rc = OpLabel",
           "OpBranch %ga_rm",
           "%ga_rm = OpLabel",
           "OpBranch %ga_m",
@@ -577,6 +584,7 @@ class Gen:
         self.fmt_enc_fn = None    # shared format encoder for stores through a dynamic V#
         self.guard_fn = None      # --address-guard: lines of %guard_fn, once an access needs it
         self.guard_last = None    # --address-guard: (guarded address, unguarded address) of the last host_addr
+        self.guard_count = None   # --address-guard: a %bool id, whether the access host_addr guards happens
         self.uses_fmt_tables = False    # %fmt_desc_tab / %fmt_norm_rep_tab: a format's kind and channel widths
         self.x_round_fns: dict[str, list[str]] = {}       # emulate_inline: helper functions for x_round pre-barrier setup
         self.x_round_fn_types: dict[int, str] = {}        # emulate_inline: arity -> OpTypeFunction id for x_round_fns
@@ -1784,7 +1792,10 @@ class Gen:
             self.guard_fn = guard_function(self.cl, self.cu)
             guard_entry(self.cl, self.cu)     # registers the entry block's constants while they can still be declared
         r = self.tmp()
-        self.emit(f"{r} = OpFunctionCall %ulong %guard_fn %heap_base %gd_on %gd_limit %gd_table {offset} {delta} {sink}")
+        # Whether the access happens: buffer_load sets it (it guards before its bounds checks); every other access does.
+        count = self.guard_count or "%true"
+        self.emit(f"{r} = OpFunctionCall %ulong %guard_fn %heap_base %gd_on %gd_limit %gd_table {offset} {delta} {sink} "
+                  f"{count}")
         self.guard_last = (r, unguarded)
         return r
 
@@ -2609,7 +2620,21 @@ class Gen:
         vd = a[0]
         addr, _, in_b, raw_parts, step = self.buffer_address(a, mods, parts=True)
         act = self.active_b()
+        if ADDRESS_GUARD:
+            # The guarded address is computed for every lane, before the bounds checks below: a lane that is inactive
+            # or loads no dword in range gets the sink like any refused one but is not counted (its load never runs).
+            if raw_parts is None:
+                some = in_b
+            else:
+                some = raw_parts(0)
+                for i in range(1, n):
+                    either = self.tmp()
+                    self.emit(f"{either} = OpLogicalOr %bool {some} {raw_parts(i)}")
+                    some = either
+            self.guard_count = self.tmp()
+            self.emit(f"{self.guard_count} = OpLogicalAnd %bool {act} {some}")
         ptr, host = self.tmp(), self.host_addr(addr, "load", lambda: self.guard_delta(n, step))
+        self.guard_count = None
         self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {host}")
 
         def guarded(cond, dwords):
@@ -16572,7 +16597,7 @@ def assemble(gen):
     if gen.guard_fn:
         # --address-guard: (heap_base, on, limit, table, offset, delta, sink) -> host address; no other function
         # type of the module has this signature.
-        types.append("%fn_guard = OpTypeFunction %ulong %ulong %bool %ulong %ulong %ulong %ulong %ulong")
+        types.append("%fn_guard = OpTypeFunction %ulong %ulong %bool %ulong %ulong %ulong %ulong %ulong %bool")
     if gen.fmt_fn or gen.fmt_enc_fn:
         types.append("%v4uint_fmt = OpTypeVector %uint 4")      # dedupe_types merges it with any other uvec4
     if gen.fmt_fn:
