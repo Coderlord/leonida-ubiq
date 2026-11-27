@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <string_view>
 #include <vector>
 
 namespace np = leonida::native_pso;
@@ -12,6 +13,9 @@ namespace np = leonida::native_pso;
 namespace {
 
 int g_failures = 0;
+
+// plan() also asks which stage a native code range holds (#1592: the pipeline library's index); these blobs have none.
+const auto no_code_stage = [](const np::Pair&) { return std::string_view{}; };
 
 void check(bool ok, const char* what) {
     std::printf("%s %s\n", ok ? "PASS" : "FAIL", what);
@@ -130,10 +134,10 @@ void pipeline() {
     desc.state_a = {a.data(), a.size()};
     desc.state_b = {b.data(), b.size()};
     np::HashMap map;
-    auto p = np::plan(desc, map);
+    auto p = np::plan(desc, map, no_code_stage);
     check(p.state.blend && p.state.blend->blend[0] == 0xe5010504, "plan() decodes blob A into FixedState::blend");
     desc.state_a = {};
-    p = np::plan(desc, map);
+    p = np::plan(desc, map, no_code_stage);
     check(!p.state.blend, "without blob A, FixedState::blend stays empty");
 }
 
