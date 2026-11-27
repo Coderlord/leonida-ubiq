@@ -1943,7 +1943,12 @@ structure changes. The function computes `end = offset + span - 1` and then deci
   32-bit loads (level 1, then level 2).
 - **Refused:** an access whose bits are not both set adds 1 to the header's count, writes its offset, and goes to the
   zero area (a load) or the dump area (a store or atomic), at its offset within its page. Alignment is kept, and every
-  span fits inside a sink.
+  span fits inside a sink. Only an access that happens is counted: `buffer_load_dword[xN]` computes its address for
+  every lane before its `OOB_SELECT` checks, so it passes `%guard_fn` whether the lane is active and loads some dword
+  in range. An inactive or out-of-range lane, which never loads and reads 0 as on hardware, still gets the sink address
+  but is not counted (`tests/semantic/test_address_guard.py`, `RefusalCountsOnlyAccesses`). Before, those lanes were
+  most of the count: on one 30-minute retail run, every sampled refusal sat far past its V#'s records, with a
+  valid base.
 - **Atomics** run on the dump area, and their returned value is replaced by 0 (`Gen.guard_zero`). The CAS loops (float
   min/max, inc/dec) end there too, as on any other memory.
 
