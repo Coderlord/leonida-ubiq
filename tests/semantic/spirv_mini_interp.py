@@ -111,6 +111,7 @@ _PURE = frozenset({
     "OpINotEqual", "OpSLessThan", "OpULessThan", "OpUGreaterThan", "OpUGreaterThanEqual", "OpCopyObject",
     "OpBitcast",
     "OpBitFieldUExtract", "OpBitFieldSExtract", "OpBitFieldInsert",
+    "OpSDot", "OpSDotKHR", "OpSDotAccSat", "OpSDotAccSatKHR",
 })
 
 
@@ -1234,6 +1235,25 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
                 raise UnsupportedConstruct("bit-field insert beyond 32 bits (undefined in SPIR-V)")
             mk = ((1 << cnt) - 1) << off
             values[res] = ((base & ~mk) | ((ins << off) & mk)) & MASK
+        elif op in ("OpSDot", "OpSDotKHR", "OpSDotAccSat", "OpSDotAccSatKHR"):
+            # SPV_KHR_integer_dot_product on packed operands only: the four signed bytes of two 32-bit integers,
+            # multiplied pairwise and summed without overflow; OpSDot keeps the low bits of that sum, OpSDotAccSat
+            # adds the accumulator to it with signed saturation to the result's width.
+            sat = "AccSat" in op
+            if a[4 if sat else 3] not in ("PackedVectorFormat4x8Bit", "PackedVectorFormat4x8BitKHR"):
+                raise UnsupportedConstruct(f"{op} without PackedVectorFormat4x8Bit")
+            x, y = val(a[1]), val(a[2])
+
+            def sbyte(v, k):
+                b = (v >> (8 * k)) & 0xFF
+                return b - 256 if b & 0x80 else b
+            dot = sum(sbyte(x, k) * sbyte(y, k) for k in range(4))
+            bits = types.bits(a[0])
+            if sat:
+                acc = val(a[3])
+                acc = acc - (1 << bits) if acc >> (bits - 1) else acc
+                dot = max(-(1 << (bits - 1)), min((1 << (bits - 1)) - 1, dot + acc))
+            values[res] = dot & ((1 << bits) - 1)
         elif op == "OpConvertUToPtr":
             values[res] = ("psb", val(a[1]))
             pointers[res] = values[res]

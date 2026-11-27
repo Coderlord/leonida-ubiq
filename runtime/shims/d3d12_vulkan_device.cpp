@@ -23295,6 +23295,8 @@ HRESULT create_vulkan_device_standalone(REFIID riid, void** out, QueueTestSettin
     info.push_constants_need_fallback = (info.max_push_constants_size < 144);
     std::fprintf(stderr, "[rt] d3d12: Vulkan device: %s (maxPushConstantsSize: %u bytes)\n", chosen.deviceName,
                  chosen.limits.maxPushConstantsSize);
+    // Modules translated with `rdna2spirv.py --int-dot-product` (index feature shaderIntegerDotProduct) need it.
+    std::fprintf(stderr, "[rt] d3d12: shaderIntegerDotProduct %s\n", v13.integer_dot_product ? "enabled" : "not available");
     std::fprintf(stderr,
                  "[rt] d3d12: subgroup sizes %u..%u (default %u), requirable in stages 0x%x, subgroupSizeControl %s, "
                  "computeFullSubgroups %s\n",

@@ -103,6 +103,11 @@ MESH_COMPUTE = False
 # runs its waves one after the other in 64 invocations, one pass per wave, so each pass is a single wave (the
 # inline_all structured form) instead of several waves side by side under mini-schedulers. See assemble().
 MESH_SERIAL_WAVES = False
+# --int-dot-product: v_dot4_i32_i8 and v_dot4c_i32_i8 as one packed signed-byte dot product (OpSDot with
+# PackedVectorFormat4x8Bit, SPV_KHR_integer_dot_product; Vulkan 1.3's shaderIntegerDotProduct)
+# instead of eight byte extracts, four multiplies and four adds. The same exact sum: the four products of signed
+# bytes added without overflow; the addend and clamp as before (wrap, or signed saturation).
+INT_DOT_PRODUCT = False
 # --pc-tail-ubo: for devices with 128 bytes of push constants, Vulkan's minimum (AMD's Windows driver on RDNA2 iGPUs,
 # some Intel Arc drivers; D3D-14's push_constants_need_fallback). The push-constant block keeps s0..s31 (128 bytes).
 # The tail that follows them by default (dwords 32..35: heap base, code base; 36..37: the --mesh-compute output
@@ -556,6 +561,7 @@ class Gen:
         self.cur_either = ()
         self.x_lanes = 64          # emulate: workgroup invocations rounded up to whole waves
         self.ms_serial = 0         # --mesh-serial-waves: number of passes (waves run one after the other), or 0
+        self.uses_int_dot = False  # --int-dot-product: an OpSDot was emitted (capabilities DotProductKHR, ...)
         self.scc_live = None       # emulate: set of id(ins) whose SCC write is live-out (wave64_emulate_opt)
         self.cur_scc_live = True   # emulate: whether the current instruction's SCC result is live-out
         self.bar_rounds = False    # native wave32 cs with an s_barrier outside uniform control flow (bar_scheduler)
@@ -12903,18 +12909,37 @@ class Gen:
             acc = self.src_u(a[3]) if is_vop3p else self.src_u(a[0])
             x_offs = (16 * sel[0], 16 * sel[0] + 8, 16 * selhi[0], 16 * selhi[0] + 8)
             y_offs = (16 * sel[1], 16 * sel[1] + 8, 16 * selhi[1], 16 * selhi[1] + 8)
-            dot = None
-            for xo, yo in zip(x_offs, y_offs):
-                xb, yb, prod = self.tmp(), self.tmp(), self.tmp()
-                self.emit(f"{xb} = OpBitFieldSExtract %uint {x} {self.cu(xo)} {self.cu(8)}")
-                self.emit(f"{yb} = OpBitFieldSExtract %uint {y} {self.cu(yo)} {self.cu(8)}")
-                self.emit(f"{prod} = OpIMul %uint {xb} {yb}")
-                if dot is None:
-                    dot = prod
-                else:
-                    s = self.tmp()
-                    self.emit(f"{s} = OpIAdd %uint {dot} {prod}")
-                    dot = s
+            if INT_DOT_PRODUCT:
+                # --int-dot-product: the four byte products and their sum in one packed signed-byte dot product,
+                # exact (the sum is in [-65024, 65536]). A source whose byte pairs are not in their natural order
+                # (op_sel / op_sel_hi other than 0 / 1) is packed first: the 16-bit half op_sel picks below the one
+                # op_sel_hi picks. The addend and clamp follow as below.
+                self.uses_int_dot = True
+                packed = []
+                for src, lo, hi in ((x, sel[0], selhi[0]), (y, sel[1], selhi[1])):
+                    if (lo, hi) == (0, 1):
+                        packed.append(src)
+                        continue
+                    l16, h16, both = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{l16} = OpBitFieldUExtract %uint {src} {self.cu(16 * lo)} {self.cu(16)}")
+                    self.emit(f"{h16} = OpBitFieldUExtract %uint {src} {self.cu(16 * hi)} {self.cu(16)}")
+                    self.emit(f"{both} = OpBitFieldInsert %uint {l16} {h16} {self.cu(16)} {self.cu(16)}")
+                    packed.append(both)
+                dot = self.tmp()
+                self.emit(f"{dot} = OpSDotKHR %uint {packed[0]} {packed[1]} PackedVectorFormat4x8BitKHR")
+            else:
+                dot = None
+                for xo, yo in zip(x_offs, y_offs):
+                    xb, yb, prod = self.tmp(), self.tmp(), self.tmp()
+                    self.emit(f"{xb} = OpBitFieldSExtract %uint {x} {self.cu(xo)} {self.cu(8)}")
+                    self.emit(f"{yb} = OpBitFieldSExtract %uint {y} {self.cu(yo)} {self.cu(8)}")
+                    self.emit(f"{prod} = OpIMul %uint {xb} {yb}")
+                    if dot is None:
+                        dot = prod
+                    else:
+                        s = self.tmp()
+                        self.emit(f"{s} = OpIAdd %uint {dot} {prod}")
+                        dot = s
             total = self.tmp()
             self.emit(f"{total} = OpIAdd %uint {acc} {dot}")
             if has_clamp:
@@ -16385,6 +16410,8 @@ def assemble(gen):
         caps.append("FMAKHR")
     if gen.uses_clock:
         caps.append("ShaderClockKHR")
+    if gen.uses_int_dot:
+        caps += ["DotProductKHR", "DotProductInput4x8BitPackedKHR"]   # shaderIntegerDotProduct
     if gen.uses_dynamic_sampled_index:
         caps.append("SampledImageArrayDynamicIndexing")
     if gen.uses_dynamic_storage_index:
@@ -16424,6 +16451,8 @@ def assemble(gen):
         exts.append("SPV_KHR_fma")
     if gen.uses_clock:
         exts.append("SPV_KHR_shader_clock")
+    if gen.uses_int_dot:
+        exts.append("SPV_KHR_integer_dot_product")
     if bary_builtin:
         exts.append("SPV_KHR_fragment_shader_barycentric")
     if ms and not msc:
@@ -19853,6 +19882,7 @@ def shader_meta(g, asm, src_path=None, fssm_path=None):
              "ClipDistance": "shaderClipDistance", "CullDistance": "shaderCullDistance",
              "ShaderLayer": "shaderOutputLayer", "ShaderViewportIndex": "shaderOutputViewportIndex",
              "DrawParameters": "shaderDrawParameters",
+             "DotProductKHR": "shaderIntegerDotProduct",
              }     # FMAKHR: shaderFmaFloat32 / shaderFmaFloat64 (VK_KHR_shader_fma) by the width used, below
     m = {"stage": g.stage, "wave64": bool(g.wave64), "control_flow": getattr(g, "control_flow", "straight line"),
          # How fused multiply-adds were emitted. --fma khr is already implied by the FMAKHR capability,
@@ -20320,6 +20350,10 @@ def main():
                     help="with --wave64-emulate: a mesh shader of more than 64 threads whose waves cannot pass each "
                          "other anything (no LDS, no store or atomic) runs its waves one after the other in 64 "
                          "invocations, one single-wave pass per wave, instead of side by side (docs/design.md)")
+    ap.add_argument("--int-dot-product", action="store_true",
+                    help="v_dot4_i32_i8 / v_dot4c_i32_i8 as one packed signed-byte dot product (OpSDot, "
+                         "SPV_KHR_integer_dot_product; needs Vulkan 1.3's shaderIntegerDotProduct, index feature "
+                         "shaderIntegerDotProduct) instead of byte extracts, multiplies and adds")
     ap.add_argument("--shader-clock", choices=("off", "khr"), default="off",
                     help="s_memtime / s_memrealtime: off = Unsupported (default), khr = OpReadClockKHR (needs "
                          "VK_KHR_shader_clock; feature shaderSubgroupClock / shaderDeviceClock in the metadata)")
@@ -20387,6 +20421,7 @@ def main():
     MAX_STRUCTURED_DEPTH = a.max_structured_depth
     global STRUCTURED, WAVE64_EMULATE, WAVE64_GRAPHICS, BARY_FALLBACK, TEXEL_OFFSET_FALLBACK, MESH_COMPUTE, FMA_KHR, SHADER_CLOCK, F16_HALVES, OPT_SPIRV
     global MESH_SERIAL_WAVES
+    global INT_DOT_PRODUCT
     global PC_TAIL_UBO, ADDRESS_GUARD
     PC_TAIL_UBO = a.pc_tail_ubo
     ADDRESS_GUARD = a.address_guard
@@ -20403,6 +20438,7 @@ def main():
     TEXEL_OFFSET_FALLBACK = a.texel_offset_fallback
     MESH_COMPUTE = a.mesh_compute
     MESH_SERIAL_WAVES = a.mesh_serial_waves
+    INT_DOT_PRODUCT = a.int_dot_product
     F16_HALVES = a.f16_interp_fallback
     OPT_SPIRV = a.opt
     if a.merge:
